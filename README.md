@@ -1,4 +1,4 @@
-# escan
+# EScan
 
 Driverless scanning for eSCL / AirScan scanners on macOS. No vendor driver, no Image Capture, no vendor app. Just `curl` and the scanner's own HTTP+XML interface.
 
