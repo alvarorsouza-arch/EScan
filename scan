@@ -1,0 +1,367 @@
+#!/bin/zsh
+# scan - escaneia numa impressora multifuncao via eSCL (AirScan). Sem driver, sem Image Capture, sem app do fabricante.
+# Testado em EPSON L4260; o protocolo e o mesmo para qualquer scanner eSCL.
+#
+# Uso:
+#   scan                       documento 300 dpi em PDF (padrao)
+#   scan doc|color|hi|bw|jpg   presets de modo
+#   scan preview               preview ultra rapido (100 dpi, JPEG) do vidro inteiro
+#   scan area X Y L A          escaneia SO a regiao indicada, em unidades de 1/300 de polegada
+#   scan multi N               N paginas no vidro, junta num PDF
+#   scan discover              mostra o que foi descoberto na rede (host, porta, MAC)
+#   scan status|wake|fix|list  utilitarios
+#
+# Flags (valem para doc/color/hi/bw/jpg/area):
+#   --dpi 100|200|300|600|1200   resolucao final
+#   --fmt pdf|jpg                formato
+#   --cor gray|rgb|bw            cor
+#   --no-open                    nao abre no Preview ao terminar
+#
+# Alvo na rede: nada precisa ser hardcoded. A ordem de busca e
+#   1) ESCAN_HOST no ambiente ou ESCAN_HOST=... em ~/.config/escan/escanrc
+#   2) cache em ~/.config/escan/host
+#   3) Bonjour: browse _uscan._tcp e depois lookup da instancia
+# O MAC para Wake-on-LAN sai do final do UUID que o proprio eSCL devolve.
+#
+# Geometria do vidro: lida de ScannerCapabilities (MaxWidth/MaxHeight).
+emulate -L zsh
+set -u
+
+CONF_DIR="${HOME}/.config/escan"
+OUT_DIR="${ESCAN_OUT:-${HOME}/Documents/Scans}"
+CURL=(curl -sk --noproxy '*' --connect-timeout 6)   # --noproxy: ignora proxy TUN (Clash/Surge) que intercepta a LAN
+
+log() { print -r -- "$*" }
+
+# ---------------- configuracao local (opcional, nao versionada) ----------------
+if [[ -r "${CONF_DIR}/escanrc" ]]; then
+  source "${CONF_DIR}/escanrc"
+fi
+HOST="${ESCAN_HOST:-}"
+PORT="${ESCAN_PORT:-443}"
+BROADCAST="${ESCAN_BROADCAST:-}"
+GLASS_W=2550
+GLASS_H=3510
+
+bonjour_lookup() {
+  # devolve "host porta" da primeira instancia _uscan._tcp anunciada na rede
+  local inst out
+  inst=$( (dns-sd -B _uscan._tcp local. 2>/dev/null & p=$!; sleep 3; kill $p 2>/dev/null) \
+          | awk '/Add/ { i=index($0,"_uscan._tcp."); if (i>0) { print substr($0, i+13); exit } }' \
+          | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' )
+  [[ -z "$inst" ]] && return 1
+  out=$( (dns-sd -L "$inst" _uscan._tcp local. 2>/dev/null & p=$!; sleep 4; kill $p 2>/dev/null) \
+         | grep -o 'reached at [^ ]*' | head -1 | sed 's/reached at //' )
+  [[ -z "$out" ]] && return 1
+  local h="${out%%:*}"; local p="${out##*:}"
+  h="${h%.}"          # remove o ponto final do FQDN mDNS
+  print -r -- "$h $p"
+}
+
+resolve_ip() {
+  # devolve o IPv4 de um hostname local (para o WoL sair no broadcast certo da /24)
+  local h="$1" ip
+  ip=$(dscacheutil -q host -a name "$h" 2>/dev/null | awk '/ip_address/ {print $2; exit}')
+  [[ -z "$ip" ]] && ip=$(dig +short "$h" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+  [[ -n "$ip" ]] && print -r -- "$ip"
+}
+
+pick_host() {
+  local h p pair
+  # 1) explicito
+  if [[ -n "$HOST" ]]; then
+    if "${CURL[@]}" -m 8 "https://${HOST}:${PORT}/eSCL/ScannerCapabilities" 2>/dev/null | grep -q "ScannerCapabilities"; then
+      BASE="https://${HOST}:${PORT}/eSCL"; return 0
+    fi
+  fi
+  # 2) cache
+  if [[ -r "${CONF_DIR}/host" ]]; then
+    read -r h p < "${CONF_DIR}/host"
+    if [[ -n "$h" ]] && "${CURL[@]}" -m 8 "https://${h}:${p:-443}/eSCL/ScannerCapabilities" 2>/dev/null | grep -q "ScannerCapabilities"; then
+      HOST="$h"; PORT="${p:-443}"; BASE="https://${HOST}:${PORT}/eSCL"; return 0
+    fi
+  fi
+  # 3) Bonjour
+  pair=$(bonjour_lookup) || return 1
+  h=${pair%% *}; p=${pair##* }
+  [[ -z "$h" ]] && return 1
+  if "${CURL[@]}" -m 8 "https://${h}:${p}/eSCL/ScannerCapabilities" 2>/dev/null | grep -q "ScannerCapabilities"; then
+    HOST="$h"; PORT="$p"; BASE="https://${HOST}:${PORT}/eSCL"
+    mkdir -p "$CONF_DIR" && print -r -- "${HOST} ${PORT}" > "${CONF_DIR}/host"
+    return 0
+  fi
+  return 1
+}
+
+read_capabilities() {
+  local caps
+  caps=$("${CURL[@]}" -m 12 "${BASE}/ScannerCapabilities" 2>/dev/null)
+  [[ -z "$caps" ]] && return 1
+  local w h
+  w=$(print -r -- "$caps" | grep -o '<scan:MaxWidth>[0-9]*' | head -1 | sed 's/.*>//')
+  h=$(print -r -- "$caps" | grep -o '<scan:MaxHeight>[0-9]*' | head -1 | sed 's/.*>//')
+  [[ -n "$w" ]] && GLASS_W="$w"
+  [[ -n "$h" ]] && GLASS_H="$h"
+  CAPS_MAC=$(print -r -- "$caps" | grep -o '<scan:UUID>[^<]*' | head -1 | sed 's/<scan:UUID>//' | awk -F- '{print $NF}')
+  CAPS_MODEL=$(print -r -- "$caps" | grep -o '<pwg:MakeAndModel>[^<]*' | head -1 | sed 's/<pwg:MakeAndModel>//')
+  return 0
+}
+
+wol() {
+  local mac="$1" bcast="$2"
+  [[ -z "$mac" ]] && return 1
+  perl -e 'print "\xff" x 6, pack("H*", $ARGV[0]) x 20' "$mac" 2>/dev/null \
+    | nc -u -w1 "$bcast" 9 2>/dev/null
+  perl -e 'print "\xff" x 6, pack("H*", $ARGV[0]) x 20' "$mac" 2>/dev/null \
+    | nc -u -w1 "$HOST" 9 2>/dev/null
+}
+
+derive_broadcast() {
+  # assume /24 quando o alvo resolve para um IPv4; ESCAN_BROADCAST no escanrc cobre outras mascaras
+  [[ -n "$BROADCAST" ]] && return 0
+  local ip="$HOST"
+  [[ "$ip" != <->.<->.<->.<-> ]] && ip=$(resolve_ip "$HOST")
+  if [[ -n "$ip" && "$ip" == <->.<->.<->.<-> ]]; then
+    BROADCAST="${ip%.*}.255"
+  else
+    BROADCAST="255.255.255.255"
+  fi
+}
+
+state() {
+  local s
+  s=$("${CURL[@]}" -m 10 "${BASE}/ScannerStatus" 2>/dev/null \
+      | grep -o '<pwg:State>[^<]*' | head -1 | sed 's/<pwg:State>//')
+  [[ -n "$s" ]] && print -r -- "$s" || print -r -- "mudo"
+}
+
+# jobs abandonados travam o scanner em "Processing" para sempre
+clear_orphans() {
+  local jobs j
+  jobs=$("${CURL[@]}" -m 10 "${BASE}/ScannerStatus" 2>/dev/null \
+         | grep -o '<pwg:JobUri>[^<]*' | sed 's|<pwg:JobUri>||')
+  for j in ${(f)jobs}; do
+    [[ -z "$j" ]] && continue
+    log "  limpando job preso: ${j:t}"
+    "${CURL[@]}" -m 15 -X DELETE "${BASE}${j#/eSCL}" -o /dev/null 2>/dev/null
+  done
+}
+
+ensure_ready() {
+  local i st
+  if pick_host; then
+    log "alvo: ${HOST}:${PORT}"
+    read_capabilities
+  else
+    log "aviso: nenhum scanner eSCL encontrado na rede (Bonjour)"
+    return 1
+  fi
+  for i in {1..12}; do
+    st=$(state)
+    if [[ "$st" == "Idle" ]]; then log "scanner: Idle"; return 0; fi
+    if [[ "$st" == "mudo" ]]; then
+      derive_broadcast
+      log "scanner mudo - acordando via WoL em ${BROADCAST} (tentativa $i)"
+      wol "$CAPS_MAC" "$BROADCAST"; sleep 6; pick_host; continue
+    fi
+    log "scanner: $st - limpando jobs presos (tentativa $i)"
+    clear_orphans; sleep 4
+  done
+  return 1
+}
+
+# ---------------- parsing ----------------
+SUB="doc"; OPEN=1; NPAGES=0
+F_COLOR=""; F_RES=""; F_FMT=""; F_EXT=""
+NUMS=()
+while (( $# )); do
+  case "$1" in
+    --no-open) OPEN=0 ;;
+    --dpi) shift; RES="${1:-}"; [[ "$RES" == (100|200|300|600|1200) ]] || { log "FALHA: --dpi precisa ser 100, 200, 300, 600 ou 1200"; exit 2; }; F_RES="$RES" ;;
+    --fmt) shift; case "${1:-}" in pdf) F_FMT=application/pdf; F_EXT=pdf ;; jpg|jpeg) F_FMT=image/jpeg; F_EXT=jpg ;; *) log "FALHA: --fmt pdf ou jpg"; exit 2 ;; esac ;;
+    --cor) shift; case "${1:-}" in gray|doc) F_COLOR=Grayscale8 ;; rgb|color) F_COLOR=RGB24 ;; bw) F_COLOR=BlackAndWhite1 ;; *) log "FALHA: --cor gray, rgb ou bw"; exit 2 ;; esac ;;
+    doc|color|hi|bw|jpg|preview|multi|area|status|wake|fix|list|discover) SUB="$1" ;;
+    <->) NUMS+=("$1") ;;
+    *) log "opcao desconhecida: $1"; exit 2 ;;
+  esac
+  shift
+done
+
+# presets de modo; flags explicitas tem prioridade sobre o preset
+case "$SUB" in
+  doc)     P_COLOR=Grayscale8;     P_RES=300;  P_FMT=application/pdf; P_EXT=pdf ;;
+  color)   P_COLOR=RGB24;          P_RES=300;  P_FMT=application/pdf; P_EXT=pdf ;;
+  hi)      P_COLOR=RGB24;          P_RES=600;  P_FMT=application/pdf; P_EXT=pdf ;;
+  bw)      P_COLOR=BlackAndWhite1; P_RES=300;  P_FMT=application/pdf; P_EXT=pdf ;;
+  jpg)     P_COLOR=RGB24;          P_RES=300;  P_FMT=image/jpeg;      P_EXT=jpg ;;
+  preview) P_COLOR=Grayscale8;     P_RES=100;  P_FMT=image/jpeg;      P_EXT=jpg ;;
+  *)       P_COLOR=Grayscale8;     P_RES=300;  P_FMT=application/pdf; P_EXT=pdf ;;
+esac
+COLOR=${F_COLOR:-$P_COLOR}
+RES=${F_RES:-$P_RES}
+FMT=${F_FMT:-$P_FMT}
+EXT=${F_EXT:-$P_EXT}
+
+if [[ "$SUB" == "discover" ]]; then
+  if pick_host; then
+    read_capabilities
+    derive_broadcast
+    log "host:    ${HOST}:${PORT}"
+    log "modelo:  ${CAPS_MODEL}"
+    log "vidro:   ${GLASS_W} x ${GLASS_H} unidades (1/300 pol)"
+    log "WoL:     broadcast ${BROADCAST}"
+    log "MAC:     ${CAPS_MAC:0:2}:${CAPS_MAC:2:2}:**:**:**:**  (oculto; completo em ${BASE}/ScannerCapabilities)"
+    log "cache:   ${CONF_DIR}/host"
+  else
+    log "nenhum scanner eSCL visto na rede. Defina ESCAN_HOST no escanrc."
+  fi
+  exit 0
+fi
+
+pick_host || log "aviso: scanner nao respondeu"
+
+case "$SUB" in
+  status) "${CURL[@]}" -m 10 "${BASE}/ScannerStatus"; print -r -- ""; exit 0 ;;
+  wake)   derive_broadcast; read_capabilities; wol "$CAPS_MAC" "$BROADCAST"; sleep 8; pick_host; state; exit 0 ;;
+  fix)    clear_orphans; state; exit 0 ;;
+  list)   "${CURL[@]}" -m 10 "${BASE}/ScannerCapabilities" | tr '>' '>\n' \
+           | grep -iE "XResolution|DocumentFormat|ColorMode|MaxWidth|MaxHeight" \
+           | sed 's/<[^>]*>//g' | grep -v '^$'; exit 0 ;;
+esac
+
+mkdir -p "$OUT_DIR"
+STAMP=$(date +%Y%m%d-%H%M%S)
+
+# ---------------- regiao de trabalho ----------------
+X=0; Y=0; W=$GLASS_W; H=$GLASS_H
+if [[ "$SUB" == "area" ]]; then
+  (( ${#NUMS} >= 4 )) || { log "FALHA: area precisa de 4 numeros: X Y LARGURA ALTURA (unidades de 1/300 pol)"; exit 2; }
+  X=$NUMS[1]; Y=$NUMS[2]; W=$NUMS[3]; H=$NUMS[4]
+  (( X < 0 )) && X=0
+  (( Y < 0 )) && Y=0
+  (( X + W > GLASS_W )) && { W=$(( GLASS_W - X )); log "aviso: largura ajustada para ${W}"; }
+  (( Y + H > GLASS_H )) && { H=$(( GLASS_H - Y )); log "aviso: altura ajustada para ${H}"; }
+  (( W < 60 || H < 60 )) && { log "FALHA: regiao pequena demais (min 60 unidades = 0,2 pol)"; exit 2; }
+fi
+
+log "==> ${SUB} | ${COLOR} | ${RES} dpi | regiao ${X},${Y} ${W}x${H}"
+ensure_ready || { log "FALHA: scanner nao ficou Idle. Confira: ligada, na mesma rede, eSCL habilitado."; exit 1 }
+
+# O namespace com hífen (escl/2011-05-03) devolve HTTP 400 na Epson; com barra funciona.
+BODY="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<scan:ScanSettings xmlns:scan=\"http://schemas.hp.com/imaging/escl/2011/05/03\" xmlns:pwg=\"http://www.pwg.org/schemas/2010/12/sm\">
+  <pwg:Version>2.6</pwg:Version>
+  <pwg:ScanRegions>
+    <pwg:ScanRegion>
+      <pwg:XOffset>${X}</pwg:XOffset>
+      <pwg:YOffset>${Y}</pwg:YOffset>
+      <pwg:Width>${W}</pwg:Width>
+      <pwg:Height>${H}</pwg:Height>
+      <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
+  <scan:InputSource>Platen</scan:InputSource>
+  <pwg:DocumentFormat>${FMT}</pwg:DocumentFormat>
+  <scan:ColorMode>${COLOR}</scan:ColorMode>
+  <scan:XResolution>${RES}</scan:XResolution>
+  <scan:YResolution>${RES}</scan:YResolution>
+</scan:ScanSettings>"
+
+create_job() {
+  local hdr code loc
+  hdr=$(mktemp)
+  code=$("${CURL[@]}" -m 30 -D "$hdr" -o /dev/null -w "%{http_code}" \
+    -X POST "${BASE}/ScanJobs" -H "Content-Type: text/xml" --data-binary "$BODY")
+  loc=$(grep -i '^location:' "$hdr" | tail -1 | sed -e 's/^[Ll]ocation: *//' -e 's/\r$//')
+  rm -f "$hdr"
+  [[ "$code" == "201" && -n "$loc" ]] || { log "FALHA: ScanJobs -> HTTP $code"; return 1; }
+  JOB="$loc"
+  return 0
+}
+
+fetch_page() {
+  local out="$1" i c2
+  local tries=30
+  [[ "$SUB" == "preview" ]] && tries=20
+  for i in {1..$tries}; do
+    c2=$("${CURL[@]}" -m 180 -o "$out" -w "%{http_code}" "${JOB}/NextDocument")
+    [[ "$c2" == "200" ]] && return 0
+    [[ "$c2" == "404" || "$c2" == "410" || "$c2" == "503" ]] && { log "  varrendo... ($i)"; sleep 2; continue; }
+    log "  NextDocument -> HTTP $c2"; sleep 2
+  done
+  return 1
+}
+
+# ---------------- 1 pagina (doc/color/hi/bw/jpg/preview/area) ----------------
+if [[ "$SUB" != "multi" ]]; then
+  create_job || exit 1
+  log "job: ${JOB:t}"
+  PREFIX="scan"
+  [[ "$SUB" == "preview" ]] && PREFIX="preview"
+  OUT="${OUT_DIR}/${PREFIX}-${STAMP}.${EXT}"
+  fetch_page "$OUT"
+  "${CURL[@]}" -m 15 -X DELETE "$JOB" -o /dev/null 2>/dev/null
+  (( $? )) && { log "FALHA: nenhuma pagina. Vidro vazio?"; exit 1; }
+  SIZE=$(stat -f%z "$OUT" 2>/dev/null)
+  (( SIZE > 1500 )) || { log "FALHA: arquivo suspeito (${SIZE} B). Vidro vazio?"; exit 1; }
+  # alguns fabricantes devolvem PDF mesmo quando se pede JPEG; ajusta a extensao ao que chegou
+  if [[ "$(head -c 4 "$OUT")" == "%PDF" && "$EXT" != "pdf" ]]; then mv "$OUT" "${OUT%.${EXT}}.pdf"; OUT="${OUT%.${EXT}}.pdf"; fi
+  log "==> salvo: ${OUT} (${SIZE} B)"
+  (( OPEN )) && open "$OUT"
+  exit 0
+fi
+
+# ---------------- multi pagina ----------------
+NPAGES=${NUMS[1]:-0}
+if (( NPAGES == 0 )); then
+  if [[ -t 0 ]]; then
+    print -n "quantas paginas? [1-30]: "
+    read -r NPAGES
+  else
+    log "FALHA: multi precisa do numero de paginas (ex.: scan multi 4)"
+    exit 2
+  fi
+fi
+[[ "$NPAGES" == <1-30> ]] || { log "FALHA: numero de paginas invalido"; exit 2; }
+
+PARTS=()
+PAGE=1
+while (( PAGE <= NPAGES )); do
+  if (( PAGE > 1 )); then
+    if [[ -t 0 ]]; then
+      print -n "coloque a pagina $PAGE no vidro e ENTER (q sai): "
+      read -r ans
+      [[ "$ans" == q ]] && break
+    else
+      log "  troque a pagina no vidro (aguardando 12s)..."
+      sleep 12
+    fi
+  fi
+  create_job || break
+  P="${OUT_DIR}/.part-${STAMP}-$(printf %02d $PAGE).pdf"
+  fetch_page "$P"
+  GOT=$?
+  "${CURL[@]}" -m 15 -X DELETE "$JOB" -o /dev/null 2>/dev/null
+  (( GOT )) || { log "  pagina $PAGE: scanner nao retornou nada - parando"; break; }
+  SIZE=$(stat -f%z "$P" 2>/dev/null)
+  (( SIZE > 1500 )) || break
+  PARTS+=("$P")
+  log "  pagina $PAGE/${NPAGES} ok (${SIZE} B)"
+  PAGE=$(( PAGE + 1 ))
+done
+OUT="${OUT_DIR}/scan-${STAMP}-${#PARTS}p.pdf"
+MERGE="${HOME}/bin/pdfmerge"
+[[ -x "$MERGE" ]] || MERGE="${0:A:h}/pdfmerge"
+if (( ${#PARTS} == 1 )); then
+  mv "$PARTS[1]" "$OUT"
+elif (( ${#PARTS} > 1 )); then
+  if [[ -x "$MERGE" ]]; then
+    "$MERGE" "$OUT" "${PARTS[@]}" >/dev/null && rm -f "${PARTS[@]}"
+  else
+    for p in "${PARTS[@]}"; do mv "$p" "${OUT%.pdf}-$(basename "$p" .pdf).pdf"; done
+    OUT="(varios arquivos em ${OUT_DIR})"
+  fi
+fi
+log "==> ${#PARTS} paginas -> ${OUT}"
+(( OPEN )) && [[ "$OUT" != "(varios)" ]] && open "$OUT"
+exit 0

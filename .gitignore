@@ -1,0 +1,21 @@
+# artefatos de build
+scanui
+pdfmerge
+Escanear.app/
+*.o
+*.dSYM/
+
+# config local com IP/MAC da sua rede — nunca vai pro repo
+escanrc
+escan.conf
+.config/
+
+# saida de scan, se alguem rodar dentro do repo
+Scans/
+*.pdf
+*.jpg
+!docs/**/*.jpg
+
+# macOS
+.DS_Store
+._*
